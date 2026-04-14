@@ -91,9 +91,7 @@ function sumLensFromTariff(items?: TariffBreakdownItem[] | null): number {
 
 function detectCataractClaim(analysis: Partial<PdfAnalysis>): boolean {
   const medicalAdmissibility = analysis.medicalAdmissibility;
-  if (!medicalAdmissibility) {
-    return false;
-  }
+  if (!medicalAdmissibility) return false;
 
   const diagnosis = (medicalAdmissibility.diagnosis || "").toLowerCase();
   const doctorNotes = (medicalAdmissibility.doctorNotes || "").toLowerCase();
@@ -119,15 +117,9 @@ function detectCataractClaim(analysis: Partial<PdfAnalysis>): boolean {
 
 function getLensCategory(lensType?: string | null): LensCategory {
   const normalized = (lensType || "").trim().toLowerCase();
-  if (!normalized || normalized === "cant determine") {
-    return "cant determine";
-  }
-  if (/(mono|uni)focal/.test(normalized)) {
-    return "monofocal";
-  }
-  if (/multifocal|bifocal|trifocal|edof|progressive/.test(normalized)) {
-    return "multifocal";
-  }
+  if (!normalized || normalized === "cant determine") return "cant determine";
+  if (/(mono|uni)focal/.test(normalized)) return "monofocal";
+  if (/multifocal|bifocal|trifocal|edof|progressive/.test(normalized)) return "multifocal";
   return "other";
 }
 
@@ -172,6 +164,54 @@ function buildCataractPolicyContext(
         : null,
     hasMetroSouthLensCap7000: aiContext?.geoLensCap7000Applicable === true,
   };
+}
+
+/**
+ * Compute the monofocal-equivalent tariff amount.
+ *
+ * Rules:
+ *  - Monofocal/Unifocal lens: use tariff as-is (payable irrespective of brand).
+ *  - Multifocal lens: restrict to (procedure package + monofocal lens R&C).
+ *    i.e. replace the multifocal lens cost with the tariff lens R&C amount.
+ *  - If lens excluded from package: add lens R&C separately.
+ */
+function computeMonofocalEquivalent(
+  lensCategory: LensCategory,
+  tariffTotalRaw: number,
+  tariffLensAmountRaw: number,
+  procedurePackageAmountRaw: number,
+  tariffLensExcluded: boolean,
+): { amount: number; notes: string[] } {
+  const notes: string[] = [];
+
+  if (lensCategory === "multifocal") {
+    // Multifocal → restrict to procedure package + monofocal R&C lens cost
+    // The tariff lens amount IS the monofocal R&C reference from tariff
+    const monofocalLensRc = tariffLensAmountRaw;
+    const procedurePart = procedurePackageAmountRaw > 0
+      ? procedurePackageAmountRaw
+      : Math.max(tariffTotalRaw - tariffLensAmountRaw, 0);
+    const restricted = procedurePart + monofocalLensRc;
+    notes.push(
+      `Multifocal lens detected. Restricted to monofocal/unifocal lens R&C (INR ${monofocalLensRc.toFixed(2)}) plus procedure package (INR ${procedurePart.toFixed(2)}) = INR ${restricted.toFixed(2)}.`,
+    );
+    return { amount: restricted, notes };
+  }
+
+  if (lensCategory === "monofocal") {
+    notes.push("Monofocal/unifocal lens is payable irrespective of brand name.");
+  }
+
+  if (tariffLensExcluded) {
+    // Package excludes lens — add lens R&C on top of procedure package
+    const amount = procedurePackageAmountRaw + tariffLensAmountRaw;
+    notes.push(
+      `Tariff package excludes lens. Procedure package (INR ${procedurePackageAmountRaw.toFixed(2)}) plus monofocal lens R&C (INR ${tariffLensAmountRaw.toFixed(2)}) = INR ${amount.toFixed(2)}.`,
+    );
+    return { amount, notes };
+  }
+
+  return { amount: tariffTotalRaw, notes };
 }
 
 export function computeClaimCalculation(
@@ -223,6 +263,7 @@ export function computeClaimCalculation(
   let finalInsurerPayable: number | null = null;
   const notes: string[] = [];
 
+  // ── NON-CATARACT ──────────────────────────────────────────────────────────
   if (!hasCataract) {
     const tariffCappedAmount =
       tariffTotal !== null
@@ -237,7 +278,11 @@ export function computeClaimCalculation(
         ? `No cataract-specific rule triggered. Applied lower of billed/tariff amount and policy limit INR ${benefitAmount.toFixed(2)}.`
         : "No cataract-specific rule triggered. Applied billed amount capped by available tariff when present.",
     );
+
+  // ── CATARACT ──────────────────────────────────────────────────────────────
   } else {
+
+    // ── NIAC Flexi Floater (highest priority NIAC rule) ───────────────────
     if (policyContext.isNIACFlexiFloater) {
       const niacFlexiCap = 24000;
       const tariffCapped =
@@ -246,45 +291,47 @@ export function computeClaimCalculation(
         benefitAmount !== null ? Math.min(tariffCapped, benefitAmount) : tariffCapped;
       finalInsurerPayable = Math.min(policyCapApplied, niacFlexiCap);
       appliedRule = "niac_flexi_floater_cap_24000";
-      notes.push(
-        "NIAC Flexi Floater cataract rule applied. Maximum payable capped at INR 24,000.00.",
-      );
+      notes.push("NIAC Flexi Floater cataract rule applied. Maximum payable capped at INR 24,000.00.");
       if (benefitAmount !== null) {
-        notes.push(
-          `Policy cataract limit INR ${benefitAmount.toFixed(2)} considered before applying NIAC Flexi cap.`,
-        );
-      }
-    } else {
-      if (lensCategory === "multifocal") {
-        notes.push(
-          "Multifocal lens used. Restricted to monofocal/unifocal lens R&C plus procedure package.",
-        );
-      } else if (lensCategory === "monofocal") {
-        notes.push(
-          "Monofocal or unifocal lens is payable irrespective of brand name.",
-        );
+        notes.push(`Policy cataract limit INR ${benefitAmount.toFixed(2)} considered before applying NIAC Flexi cap.`);
       }
 
+    // ── Standard cataract logic ───────────────────────────────────────────
+    } else {
+
+      // Step A: Compute monofocal-equivalent tariff (handles multifocal restriction)
       const hasHospitalPackage =
         procedurePackageAmount !== null || (tariffTotal !== null && !tariffLensExcluded);
-      const lensRcAmount = tariffLensAmount ?? 0;
-      const monofocalEquivalentAmount = tariffLensExcluded
-        ? (procedurePackageAmount ?? tariffTotalRaw) + lensRcAmount
-        : tariffTotalRaw;
+
+      const { amount: monofocalEquivalentAmount, notes: lensNotes } =
+        computeMonofocalEquivalent(
+          lensCategory,
+          tariffTotalRaw,
+          tariffLensAmountRaw,
+          procedurePackageAmountRaw,
+          tariffLensExcluded,
+        );
+      notes.push(...lensNotes);
 
       let allowedBeforeHospitalCap: number;
 
+      // ── RULE 1: Policy cataract limit AND hospital package → lower of both ──
       if (benefitAmount !== null && hasHospitalPackage) {
         allowedBeforeHospitalCap = Math.min(benefitAmount, monofocalEquivalentAmount);
         appliedRule = "policy_limit_or_hospital_package_lower";
         notes.push(
           `Applied lower of policy cataract limit INR ${benefitAmount.toFixed(2)} and hospital package/R&C INR ${monofocalEquivalentAmount.toFixed(2)}.`,
         );
+
+      // ── RULE 2: No policy limit → hospital package (monofocal only) ──────
       } else if (benefitAmount === null && hasHospitalPackage) {
+
         if (tariffLensExcluded) {
+          // Package excludes lens — add lens R&C separately
           let packagePlusLensRc = monofocalEquivalentAmount;
 
           if (policyContext.isPSU) {
+            // PSU-specific sub-rules
             const isRetailUpToFiveLakhs =
               policyContext.isRetailPolicy &&
               policyContext.sumInsured !== null &&
@@ -293,61 +340,50 @@ export function computeClaimCalculation(
               policyContext.isCorporatePolicy &&
               policyContext.sumInsured !== null &&
               policyContext.sumInsured > 500000;
-            let payableLens = lensRcAmount;
+            let payableLens = tariffLensAmountRaw;
 
             if (policyContext.hasMetroSouthLensCap7000 && payableLens > 0) {
               payableLens = Math.min(payableLens, 7000);
-              notes.push(
-                "PSU geography lens cap applied: monofocal lens admissibility restricted to INR 7,000.00.",
-              );
+              notes.push("PSU geography lens cap applied: monofocal lens admissibility restricted to INR 7,000.00.");
             }
 
-            packagePlusLensRc = (procedurePackageAmount ?? tariffTotalRaw) + payableLens;
+            packagePlusLensRc = procedurePackageAmountRaw + payableLens;
 
             if (isRetailUpToFiveLakhs) {
               allowedBeforeHospitalCap = packagePlusLensRc;
               appliedRule = "psu_retail_upto_5l_package_plus_lens";
-              notes.push(
-                "PSU retail policy up to INR 5,00,000 sum insured: PPN package plus monofocal lens allowed.",
-              );
+              notes.push("PSU retail policy up to INR 5,00,000 sum insured: PPN package plus monofocal lens allowed.");
             } else if (isCorporateAboveFiveLakhs && policyContext.hasNoCataractLimitClause) {
               allowedBeforeHospitalCap = Math.min(packagePlusLensRc, 45000);
               appliedRule = "psu_corporate_above_5l_no_cataract_limit_cap_45000";
-              notes.push(
-                "PSU corporate policy above INR 5,00,000 with no cataract limit clause: package plus monofocal lens capped at INR 45,000.00.",
-              );
+              notes.push("PSU corporate policy above INR 5,00,000 with no cataract limit clause: package plus monofocal lens capped at INR 45,000.00.");
             } else if (isCorporateAboveFiveLakhs) {
               allowedBeforeHospitalCap = packagePlusLensRc;
               appliedRule = "psu_corporate_above_5l_package_plus_lens";
-              notes.push(
-                "PSU corporate policy above INR 5,00,000: PPN package plus monofocal lens allowed.",
-              );
+              notes.push("PSU corporate policy above INR 5,00,000: PPN package plus monofocal lens allowed.");
             } else {
               allowedBeforeHospitalCap = packagePlusLensRc;
               appliedRule = "psu_no_policy_limit_package_plus_lens";
-              notes.push(
-                "PSU no-policy-limit cataract package excludes lens: procedure package plus monofocal lens applied.",
-              );
+              notes.push("PSU no-policy-limit cataract package excludes lens: procedure package plus monofocal lens applied.");
             }
           } else {
             allowedBeforeHospitalCap = packagePlusLensRc;
             appliedRule = policyContext.isNIAC
               ? "niac_no_policy_limit_lens_excluded"
               : "no_policy_limit_package_excludes_lens";
-            notes.push(
-              "No policy cataract limit found. Package excludes lens, so procedure package plus monofocal lens R&C is applied.",
-            );
+            notes.push("No policy cataract limit found. Package excludes lens, so procedure package plus monofocal lens R&C is applied.");
           }
 
+          // ── RULE 4: NIAC + no policy limit + package excludes lens → cap ₹50,000 ──
           if (policyContext.isNIAC) {
             allowedBeforeHospitalCap = Math.min(allowedBeforeHospitalCap, 50000);
             appliedRule = "niac_no_policy_limit_lens_excluded";
-            notes.push(
-              "NIAC exception applied: payable capped at INR 50,000.00 when no policy limit exists and the package excludes lens.",
-            );
+            notes.push("NIAC exception applied: payable capped at INR 50,000.00 when no policy limit exists and the package excludes lens.");
           }
+
         } else {
-          allowedBeforeHospitalCap = tariffTotalRaw;
+          // Package includes lens — use monofocal equivalent package
+          allowedBeforeHospitalCap = monofocalEquivalentAmount;
           appliedRule = "no_policy_limit_use_hospital_package";
           notes.push(
             lensCategory === "multifocal"
@@ -355,29 +391,29 @@ export function computeClaimCalculation(
               : "No policy cataract limit found. Agreed monofocal hospital package selected.",
           );
         }
+
+      // ── RULE 3: No policy limit + No package + Lens excluded → R&C lens only ──
       } else if (
         benefitAmount === null &&
         !hasHospitalPackage &&
         tariffLensExcluded &&
-        lensRcAmount > 0
+        tariffLensAmountRaw > 0
       ) {
-        allowedBeforeHospitalCap = lensRcAmount;
+        allowedBeforeHospitalCap = tariffLensAmountRaw;
         appliedRule = "no_policy_limit_no_package_lens_rc_only";
-        notes.push(
-          "No policy limit and no hospital package available. Applied R&C lens amount only.",
-        );
+        notes.push("No policy limit and no hospital package available. Applied R&C lens amount only.");
+
+      // ── Fallback: policy limit only, no package reference ─────────────────
       } else if (benefitAmount !== null) {
         allowedBeforeHospitalCap = Math.min(baseInsurerPayable, benefitAmount);
         appliedRule = "policy_limit_without_package";
-        notes.push(
-          `Policy cataract limit INR ${benefitAmount.toFixed(2)} applied because no package/R&C reference was available.`,
-        );
+        notes.push(`Policy cataract limit INR ${benefitAmount.toFixed(2)} applied because no package/R&C reference was available.`);
+
+      // ── Last resort: billed amount only ───────────────────────────────────
       } else {
         allowedBeforeHospitalCap = baseInsurerPayable;
         appliedRule = "billed_amount_only";
-        notes.push(
-          "Cataract detected, but no policy limit or package reference was available. Applied billed amount.",
-        );
+        notes.push("Cataract detected, but no policy limit or package reference was available. Applied billed amount.");
       }
 
       finalInsurerPayable = Math.min(allowedBeforeHospitalCap, baseInsurerPayable);
